@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Upload the Slot1+U-Net merged CSV only after PROMOTE_LOOK. Default is dry.
+
+Never uploads unless all of: merge gate == PROMOTE_LOOK, remaining looks >= 1,
+CSV exists, and --upload is passed. No --upload → print the plan and exit 0.
+Never uploads faint / merckle / U-Net standalone.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+import sys
+
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from filament.paths import ARTIFACTS, FAST_SUBMISSION_DIR
+from gate_unet_family import GATE, PROMOTE, read_gate
+
+KAGGLE = Path("~/.local/bin/kaggle")
+COMP = "filament-segmentation-2026"
+CSV = FAST_SUBMISSION_DIR / "submission_slot1_unet_merged_PROMOTE.csv"
+REMAINING = ARTIFACTS / "kaggle_quota_remaining.json"
+BANNED = ("faint", "merckle", "conf025", "phys", "tiles")
+
+
+def refuse() -> str | None:
+    decision, _ = read_gate()
+    if decision != PROMOTE:
+        return f"Refusing upload: gate is {decision!r} (need PROMOTE_LOOK)."
+    if not CSV.exists():
+        return f"Refusing upload: missing {CSV}. Run make_unet_merged_submission.py first."
+    name = CSV.name.lower()
+    if any(b in name for b in BANNED):
+        return f"Refusing upload: banned filename {CSV.name}."
+    if REMAINING.exists():
+        rem = json.loads(REMAINING.read_text()).get("remaining")
+        if rem is not None and int(rem) < 1:
+            return "Refusing upload: remaining looks is 0."
+    return None
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--upload",
+        action="store_true",
+        help="Actually call kaggle competitions submit. Default is dry.",
+    )
+    args = parser.parse_args()
+    reason = refuse()
+    out = {
+        "written": datetime.now(timezone.utc).isoformat(),
+        "csv": str(CSV),
+        "gate": str(GATE),
+        "upload_flag": args.upload,
+        "kaggle_submit_called": False,
+        "do_not_upload_faint_or_merckle": True,
+    }
+    if reason:
+        out["refused"] = reason
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        (ARTIFACTS / "upload_if_promote.json").write_text(json.dumps(out, indent=2))
+        print(reason)
+        raise SystemExit(0 if not args.upload else 1)
+    if not args.upload:
+        out["dry"] = True
+        out["would_submit"] = str(CSV)
+        ARTIFACTS.mkdir(parents=True, exist_ok=True)
+        (ARTIFACTS / "upload_if_promote.json").write_text(json.dumps(out, indent=2))
+        print(json.dumps(out, indent=2))
+        return
+    proc = subprocess.run(
+        [
+            str(KAGGLE),
+            "competitions",
+            "submit",
+            "-c",
+            COMP,
+            "-f",
+            str(CSV),
+            "-m",
+            "Slot1+UNet merge PROMOTE_LOOK local official PQ; year-shift stays Slot2",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    out["kaggle_submit_called"] = True
+    out["returncode"] = proc.returncode
+    out["stdout_tail"] = (proc.stdout or "")[-2000:]
+    out["stderr_tail"] = (proc.stderr or "")[-1000:]
+    (ARTIFACTS / "upload_if_promote.json").write_text(json.dumps(out, indent=2))
+    print(json.dumps({k: out[k] for k in ("returncode", "csv", "kaggle_submit_called")}, indent=2))
+    if proc.returncode != 0:
+        raise SystemExit(proc.returncode)
+
+
+if __name__ == "__main__":
+    main()
